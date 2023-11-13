@@ -1,0 +1,206 @@
+---
+title: DDPM数学原理
+date: '2023-11-13'
+tags: ['diffusion','图像生成']
+summary: 以一种更容易理解的方式推导出DDPM原文的损失函数
+---
+
+**参考：https://spaces.ac.cn/archives/9119/comment-page-1**
+
+### 概述
+
+- 随机高斯噪声 Z；样本数据 X
+- 目的：随机采样一个 Z，通过模型可以生成 X
+  - 本质上就是学习一个**变换关系**，可以将随机高斯噪声变为符合样本分布的数据
+
+- 存在的问题：从 Z 到 X 的跨度太大，实现很困难
+- 解决办法：一点点的进行生成，而不是一步实现，是一个渐变的过程
+
+- 思路：
+  1. 将样本数据一点点的进行加噪，最终完全变为高斯噪声
+  2. 模型的作用是估计每一步所添加的噪声，然后去噪来还原为样本数据
+
+### 加噪过程
+
+- 设 $$x_0,x_1, x_2, ... ,x_t$$表示加噪过程的图像，其中$$x_0$$为原始图像，$$x_t$$则为纯噪声 ，则有以下式子：
+  $$
+  x_t=\alpha_tx_{t-1}+\beta_t\varepsilon_t\quad,其中
+  \varepsilon_t～N(0,1)
+  \tag{1}
+  $$
+
+- 
+
+- 其中有 $$\alpha_t,\beta_t>0$$且$$\alpha_t^2+\beta_t^2=1$$，$$\beta_t$$通常很接近0，表示每一步只添加很少的噪声
+
+- 反复执行式（1）的过程：
+  $$
+  \begin{split}
+    x_t &= \alpha_tx_{t-1} + \beta_t\varepsilon_t \\
+        &= \alpha_t (\alpha_{t-1}x_{t-2} + \beta_{t-1}\varepsilon_{t-1}) \\
+        &= \cdots\cdots \\
+        &= (\alpha_t\cdots\alpha_1)x_0+(\alpha_t\cdots\alpha_2)\beta_1\varepsilon_1+(\alpha_t\cdots\alpha_3)\beta_2\varepsilon_2+\cdots+\beta_t\varepsilon_t
+  \end{split}
+  \tag{2}
+  $$
+
+- 因为$$\alpha_t^2+\beta_t^2=1$$，则式（2）的所有系数的平方和为1，即：$$(\alpha_t⋯\alpha1)^2+(\alpha_t⋯\alpha2)^2\beta_1^2+(\alpha_t⋯\alpha3)^2\beta_2^2+⋯+\alpha_t^2\beta_{t-1}^2+\beta_t^2=1$$
+
+- 而式（2）将$$x_t$$转换为了$$x_0$$与 $$t$$ 个独立正态分布的和，这 $$t$$ 个正态分布的均值为0，方差为系数的平方
+
+- 由于正态分布的叠加性，上面 $$t$$ 个正态分布的**和**的均值为0，方差为$$(\alpha_t⋯\alpha2)^2\beta_1^2+(\alpha_t⋯\alpha3)^2\beta_2^2+⋯+\alpha_t^2\beta_{t-1}^2+\beta_t^2=1-(\alpha_t⋯\alpha_1)^2$$
+
+- 到这里，可以将式（2）写为如下形式：
+  $$
+  \begin{split}
+    x_t &= (\alpha_t\cdots\alpha_1)x_0+\sqrt{1-(\alpha_t\cdots\alpha_1)^2}\cdot\bar\varepsilon_t \\
+    		&= \bar\alpha_t \cdot x_0+\bar\beta_t \cdot \bar\varepsilon_t
+  \end{split}
+  \tag{3}
+  $$
+
+- 式（3）极大简化了$$x_t$$的计算过程，通过设置超参数使得**使$$\bar\alpha_t$$趋近于0**来使得$$x_t$$趋近于标准正态分布
+
+### 恢复过程
+
+- 在上述加噪的过程中，可以得到很多数据对$$(x_{t-1}, x_t)$$，恢复的过程其实就是学习一个函数$$f$$来将$$x_t$$恢复成$$x_{t-1}$$，优化目标暂时记为$$f(x_t)$$与$$x_{t-1}$$的L2范数
+
+- 将式（1）写为以下形式：
+  $$
+  x_{t-1}=\frac{1}{\alpha_t} \cdot (x_t-\beta_t\varepsilon_t)
+  \tag{4}
+  $$
+
+- 其中$$\alpha_t$$和$\beta_t$为超参，可以将模型写成如下形式：
+  $$
+  f(x_t)=\frac{1}{\alpha_t} \cdot (x_t-\beta_t\epsilon_{\theta}(x_t,t))
+  \tag{5}
+  $$
+
+- 其中$\theta$为要训练的参数，结合加噪过程的推导（结合式1来用$x_{t-1}$表示$x_t$），优化目标可以写为以下形式：
+  $$
+  \begin{align*}
+  f(x_t) &= \frac{1}{\alpha_t}(\alpha_tx_{t-1} + \beta_t\varepsilon_t-\beta_t\epsilon_{\theta}(x_t,t)) \\
+  f(x_t) - x_{t-1} &= \frac{\beta_t}{\alpha_t}(\varepsilon_t-\epsilon_{\theta}(x_t,t)) \\
+  \lVert x_{t-1}-f(x_t) \rVert^2 &= \frac{\beta_t^2}{\alpha_t^2} \lVert \varepsilon_t-\epsilon_{\theta}(x_t, t) \rVert^2 \tag{6}
+  \end{align*}
+  $$
+
+- 又因为：
+  $$
+  \begin{split}
+  	x_t &= \alpha_tx_{t-1}+\beta_t\varepsilon_t \\
+  			&= \alpha_t(\bar\alpha_{t-1}x_0+\bar\beta_{t-1}\bar\varepsilon_{t-1})+\beta_t\varepsilon_t \\
+  			&= \bar\alpha_tx_0+\alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t
+  \end{split}
+  \tag{7}
+  $$
+
+- 忽略系数，则最终的优化目标写为：
+  $$
+  \lVert \varepsilon_t-\epsilon_{\theta}(\bar\alpha_tx_0+\alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t \,,\, t) \rVert^2
+  \tag{8}
+  $$
+
+- PS：这里之所以要通过式（7）来回退一步表示$x_t$，而不是直接根据式（3）来表示，主要是以下原因：
+  - 在加噪的过程中，只记录了添加的噪声$\varepsilon_t$，中间的噪声图像$x_t$并没有记录，因此训练时需要根据时间步$t$来计算出$x_t$
+  - 式（3）用$\bar\varepsilon_t$来表示$x_t$，其与$\varepsilon_t$不是相互独立的，$\varepsilon_t$作为ground truth，事先已经采样得到，因此无法独立采样$\bar\varepsilon_t$
+  - 式（7）用$\varepsilon_t$和$\bar\varepsilon_{t-1}$表示，$\bar\varepsilon_{t-1}$与$\varepsilon_t$相互独立，可独立采样
+
+### 降低方差
+
+- 上述式（8）已经可以完成DDPM的训练，但是可能会出现方差过大的风险，从而导致收敛过慢等问题，因为其包含四个需要采样的随机变量：
+  1. 随机样本$x_0$
+  2. 相互独立的两个标准正态分布$\bar\varepsilon_{t-1}$和$\varepsilon_t$
+  3. 时间步$t$
+
+- 要采样的随机变量过多，就可能会造成损失函数波动（方差）过大，可通过将$\bar\varepsilon_{t-1}$和$\varepsilon_t$合并为单个符合标准正态分布的随机变量
+
+- 目标是要把式（8）中出现的 $\alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t$ 的 $\bar\varepsilon_{t-1}$ 和 $\varepsilon_t$ 合并为一个随机变量，这样就可以减少采样次数
+  $$
+  \begin{align*}
+  	& 记 \, \alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t \, 为式1\\
+  	& \because \bar\varepsilon_{t-1} 和 \varepsilon_t 相互独立,且二者均符合标准正态分布 \\
+  	& \therefore 式1仍符合正态分布,其均值为0,方差为\, \alpha_t^2\bar\beta_{t-1}^2+\beta_t^2 \\
+  	& \because \bar\beta_t = \sqrt{1-(\alpha_t\cdots\alpha_1)^2}\\
+  	& \therefore \alpha_t^2\bar\beta_{t-1}^2+\beta_t^2 = \alpha_t^2\cdot[1-(\alpha_1\cdots\alpha_{t-1})^2] + \beta_t^2 \quad 记为式2 \\
+  	又& \because \alpha_t^2+\beta_t^2=1 \\
+  	& \therefore 式2=1-(\alpha_1\cdots\alpha_{t-1})^2=\bar\beta_{t}^2 \quad 即式1的方差为\bar\beta_{t}^2 \\
+  	& \therefore 可将式1写为 \bar\beta_{t}\varepsilon \,,\,其中\varepsilon符合标准正态分布 \\
+  	\\
+  	& 记 \, \beta_t\bar\varepsilon_{t-1}-\alpha_t\bar\beta_{t-1}\varepsilon_t \, 为式3 \\
+  	& 同理,可将式3写为 \bar\beta_{t}\omega \,,\,其中\omega符合标准正态分布 \\
+  \end{align*}
+  $$
+
+- 经过上述过程，得到了以下这个二元一次方程组：
+  $$
+  \begin{cases}
+  	\alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t = \bar\beta_{t}\varepsilon \\
+  	\beta_t\bar\varepsilon_{t-1}-\alpha_t\bar\beta_{t-1}\varepsilon_t = \bar\beta_{t}\omega
+  \end{cases}
+  \tag{9}
+  $$
+
+- 需要说明一下， $\varepsilon$和$\omega$是相互独立的，证明如下：
+  $$
+  \begin{align*}
+  & 要想证明相互独立，只需要证明E(\varepsilon\omega)=E(\varepsilon)E(\omega)=0即可 \\
+  & 由式(9):\\
+  & E(\bar\beta_{t}\varepsilon\bar\beta_{t}\omega)=
+  E[(\alpha_t\bar\beta_{t-1}\bar\varepsilon_{t-1}+\beta_t\varepsilon_t)(\beta_t\bar\varepsilon_{t-1}-\alpha_t\bar\beta_{t-1}\varepsilon_t)] \\
+  & 等号右边展开得： \\
+  & E(\alpha_t\beta_t\bar\beta_{t-1}\bar\varepsilon_{t-1}^2-\alpha_t^2\bar\beta_{t-1}^2\bar\varepsilon_{t-1}\varepsilon_t
+   +\beta_t^2\bar\varepsilon_{t-1}\varepsilon_t - \alpha_t\beta_t\bar\beta_{t-1}\varepsilon_{t}^2) \quad 记作式1\\
+  & \because \bar\varepsilon_{t-1}和\varepsilon_t相互独立 \\
+  & \therefore 式1第二项和第三项值为0 \\
+  & \therefore 式1=E(\alpha_t\beta_t\bar\beta_{t-1}\bar\varepsilon_{t-1}^2-\alpha_t\beta_t\bar\beta_{t-1}\varepsilon_{t}^2)
+  =E(\alpha_t\beta_t\bar\beta_{t-1}\bar\varepsilon_{t-1}^2)-E(\alpha_t\beta_t\bar\beta_{t-1}\varepsilon_{t}^2)=\alpha_t\beta_t\bar\beta_{t-1}\cdot(E(\bar\varepsilon_{t-1}^2)-E(\varepsilon_{t}^2)) \\
+  & \because k个独立正态分布的平方和服从自由度为k的卡方分布，且其期望为k \\
+  & \therefore \bar\varepsilon_{t-1}^2与\varepsilon_{t}^2均服从自由度为1的卡方分布，且期望为1 \\
+  & \therefore 式1=0，即 \varepsilon和\omega相互独立
+  \end{align*}
+  $$
+
+- 接下来解上述方程组（9），用$\varepsilon$和$\omega$表示$\varepsilon_t$得:
+  $$
+  \varepsilon_t = \frac{(\beta_t\varepsilon-\alpha_t\bar\beta_{t-1}\omega)\bar\beta_t}{\beta_t^2+\alpha_t^2\bar\beta_{t-1}^2}
+  							= \frac{\beta_t\varepsilon-\alpha_t\bar\beta_{t-1}\omega}{\bar\beta_{t}}
+  
+  \tag{10}
+  $$
+
+- 将式（9）和（10）代入式（8）可得优化目标为：
+  $$
+  \lVert
+  	\frac{\beta_t\varepsilon-\alpha_t\bar\beta_{t-1}\omega}{\bar\beta_{t}}
+  	-
+  	\epsilon_{\theta}(\bar\alpha_tx_0+\bar\beta_t\varepsilon,t)
+  \rVert^2
+  \tag{11}
+  $$
+
+- 式（11）有$\varepsilon$和$\omega$两个随机变量，其中对于$\varepsilon$是一个复杂函数，因为$\varepsilon$还包含在$\epsilon_{\theta}$中，而对于$\omega$仅是一个二次函数，因此可以尝试将$\omega$消掉，步骤如下：
+  $$
+  \begin{align*}
+  式(11) &= (\frac{\beta_t}{\bar\beta_t}\varepsilon)^2 - 2\frac{\alpha_t\beta_t\bar\beta_{t-1}}{\bar\beta_t}\varepsilon\omega
+  			- 2\frac{\beta_t}{\bar\beta_t}\varepsilon\epsilon_{\theta}+(\frac{\alpha_t\bar\beta_{t-1}\omega}{\bar\beta_t})^2
+  			+ 2\frac{\alpha_t\bar\beta_{t-1}\omega}{\bar\beta_t}\epsilon_{\theta} + \epsilon_{\theta}^2 \\
+  			&= (\frac{\beta_t}{\bar\beta_t}\varepsilon)^2 - 2\frac{\beta_t}{\bar\beta_t}\varepsilon\epsilon_{\theta} + \epsilon_{\theta}^2 + N\\
+  			&= \lVert \frac{\beta_t}{\bar\beta_t}\varepsilon - \epsilon_{\theta}(\bar\alpha_tx_0+\bar\beta_t\varepsilon,t) \rVert^2 + N \\
+  			&= (\frac{\beta_t}{\bar\beta_t})^2\lVert \varepsilon - \frac{\bar\beta_t}{\beta_t}\epsilon_{\theta}(\bar\alpha_tx_0+\bar\beta_t\varepsilon,t) \rVert^2 + N 
+  \end{align*}
+  \tag{12}
+  $$
+
+  - 第一步就是对式（11）展开
+  - 第二步主要根据以下原因进行消项：
+    1. $\varepsilon$和$\omega$相互独立
+    2. $\omega$其二次函数为一个常数N
+    3. $\epsilon_{\theta}$和$\omega$相互独立
+
+- 省略常数和权重，即为原论文最终使用的损失函数：
+  $$
+  \lVert \varepsilon - \frac{\bar\beta_t}{\beta_t}\epsilon_{\theta}(\bar\alpha_tx_0+\bar\beta_t\varepsilon,t) \rVert^2
+  \tag{12}
+  $$
