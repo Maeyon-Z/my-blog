@@ -1,0 +1,196 @@
+---
+title: 通过秒杀场景学习高并发系列处理方案（2）
+date: '2023-11-14'
+tags: ['领域事件','Cola']
+summary: 通过领域层发布事件，应用层处理实现来解决高并发场景下缓存数据的异步更新
+---
+
+### 概述
+
+- 对业务数据添加完缓存后，就会面临如下问题：让业务数据发生变更时（数据库改变），如何更新缓存数据？
+- 有如下两种解决方案：
+  - 同步处理：
+    - 同步更新，业务数据更新后立即主动更新缓存（增加数据操作步骤，失败风险更大）
+    - 同步清除，由后续请求到来时被动更新（清除缓存在高并发情景下存在流控风险）
+  - 异步处理：
+    - 类似于生产者—消费者模式，业务数据变更后，向外发布一个事件即结束。事件的接收方通过收到事件来对缓存数据进行更新
+- 本篇引入 Cola 框架实现事件机制，由领域层发布事件，应用层监听事件并进行处理
+
+### 通用领域事件模型设计与实现
+
+- 定义通用的领域事件模型，对于任何事件，都需要先封装成通用领域事件模型后再由领域层进行发布
+
+1. EventPublisher 接口：声明一个发布通用领域事件 DomainEventI 的方法
+
+```java
+public interface EventPublisher {
+    /**
+     * 发布事件
+     */
+    void publish(DomainEventI domainEvent);
+}
+```
+
+2. LocalDomainEventPublisher 类：实现上述接口，同时引入  Cola 的 EventBusI，通过其 fire 方法发布事件
+
+```java
+@Component
+public class LocalDomainEventPublisher implements EventPublisher {
+    @Autowired
+    private EventBusI eventBus;
+
+    @Override
+    public void publish(DomainEventI domainEvent) {
+        eventBus.fire(domainEvent);
+    }
+}
+```
+
+3. SeckillBaseEvent 类，定义通用的领域事件模型，实现 DomainEventI 接口，本系统所有领域事件都基于此类
+
+```java
+public class SeckillBaseEvent implements DomainEventI {
+    private Long id;
+    private Integer status;
+}
+```
+
+### 秒杀活动监听领域事件的设计与实现
+
+1. SeckillActivityEvent 类：秒杀活动领域事件类，继承自通用领域事件模型：
+
+```java
+public class SeckillActivityEvent extends SeckillBaseEvent {
+    public SeckillActivityEvent(Long id, Integer status) {
+        super(id, status);
+    }
+}
+```
+
+2. SeckillActivityEventHandler 类：秒杀活动领域事件处理类，定义在应用层下
+   - 监听秒杀活动领域事件，监听到事件后自动执行execute方法，在此方法里面实现缓存更新功能
+
+```java
+@EventHandler
+public class SeckillActivityEventHandler implements EventHandlerI<Response, SeckillActivityEvent> {
+    private final Logger logger = LoggerFactory.getLogger(SeckillActivityEventHandler.class);
+    @Autowired
+    private SeckillActivityCacheService seckillActivityCacheService;
+    @Autowired
+    private SeckillActivityListCacheService seckillActivityListCacheService;
+
+    @Override
+    public Response execute(SeckillActivityEvent seckillActivityEvent) {
+        logger.info("activityEvent|接收活动事件|{}", JSON.toJSON(seckillActivityEvent));
+        if (seckillActivityEvent == null){
+            logger.info("activityEvent|事件参数错误" );
+            return Response.buildSuccess();
+        }
+        seckillActivityCacheService.tryUpdateSeckillActivityCacheByLock(seckillActivityEvent.getId(), false);
+        seckillActivityListCacheService.tryUpdateSeckillActivityCacheByLock(seckillActivityEvent.getStatus(), false);
+        return Response.buildSuccess();
+    }
+}
+```
+
+### 秒杀活动发送领域事件设计与实现
+
+1. SeckillActivityDomainService 接口：定义的方法与SeckillActivityRepository接口相同，后续应用层service依赖此Service接口，而不再依赖Repository接口
+
+```java
+初始：interfaces Controller => application service => domain repository
+
+添加缓存后：interfaces Controller => application service & application cache service => domain repository
+  
+添加事件后：interfaces Controller => application service & application cache service => domain service => domain repository
+```
+
+```java
+public interface SeckillActivityDomainService {
+    /**
+     * 保存活动信息
+     */
+    void saveSeckillActivity(SeckillActivity seckillActivity);
+
+    /**
+     * 活动列表
+     */
+    List<SeckillActivity> getSeckillActivityList(Integer status);
+
+    /**
+     * 获取正在进行中的活动列表
+     */
+    List<SeckillActivity> getSeckillActivityListBetweenStartTimeAndEndTime(Date currentTime, Integer status);
+
+    /**
+     * 根据id获取活动信息
+     */
+    SeckillActivity getSeckillActivityById(Long id);
+
+    /**
+     * 修改状态
+     */
+    void updateStatus(Integer status, Long id);
+}
+```
+
+2. SeckillActivityDomainServiceImpl 实现类
+
+```java
+@Service
+public class SeckillActivityDomainServiceImpl implements SeckillActivityDomainService {
+    private static final Logger logger = LoggerFactory.getLogger(SeckillActivityDomainServiceImpl.class);
+    @Autowired
+    private SeckillActivityRepository seckillActivityRepository;
+    @Autowired
+    private EventPublisher eventPublisher;
+
+    @Override
+    public void saveSeckillActivity(SeckillActivity seckillActivity) {
+        logger.info("activityPublish|发布秒杀活动|{}", JSON.toJSON(seckillActivity));
+        if (seckillActivity == null || !seckillActivity.validateParams()){
+            throw new SeckillException(HttpCode.PARAMS_INVALID);
+        }
+        seckillActivity.setStatus(SeckillActivityStatus.PUBLISHED.getCode());
+        seckillActivityRepository.saveSeckillActivity(seckillActivity);
+        logger.info("activityPublish|秒杀活动已发布|{}", seckillActivity.getId());
+
+        // 构造秒杀活动领域事件并发布
+        SeckillActivityEvent seckillActivityEvent = new SeckillActivityEvent(seckillActivity.getId(), seckillActivity.getStatus());
+        eventPublisher.publish(seckillActivityEvent);
+        logger.info("activityPublish|秒杀活动事件已发布|{}", JSON.toJSON(seckillActivityEvent));
+    }
+
+    @Override
+    public List<SeckillActivity> getSeckillActivityList(Integer status) {
+        return seckillActivityRepository.getSeckillActivityList(status);
+    }
+
+    @Override
+    public List<SeckillActivity> getSeckillActivityListBetweenStartTimeAndEndTime(Date currentTime, Integer status) {
+        return seckillActivityRepository.getSeckillActivityListBetweenStartTimeAndEndTime(currentTime, status);
+    }
+
+    @Override
+    public SeckillActivity getSeckillActivityById(Long id) {
+        if (id == null){
+            throw new SeckillException(HttpCode.PASSWORD_IS_NULL);
+        }
+        return seckillActivityRepository.getSeckillActivityById(id);
+    }
+
+    @Override
+    public void updateStatus(Integer status, Long id) {
+        logger.info("activityPublish|更新秒杀活动状态|{},{}", status, id);
+        if (status == null || id == null){
+            throw new SeckillException(HttpCode.PARAMS_INVALID);
+        }
+        seckillActivityRepository.updateStatus(status, id);
+        logger.info("activityPublish|发布秒杀活动状态事件|{},{}", status, id);
+        SeckillActivityEvent seckillActivityEvent = new SeckillActivityEvent(id, status);
+        eventPublisher.publish(seckillActivityEvent);
+        logger.info("activityPublish|秒杀活动事件已发布|{}", id);
+    }
+}
+```
+
