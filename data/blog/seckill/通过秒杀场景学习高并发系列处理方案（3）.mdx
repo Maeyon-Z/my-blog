@@ -1,0 +1,183 @@
+---
+title: 通过秒杀场景学习高并发系列处理方案（3）
+date: '2023-12-01'
+tags: ['分布式','高并发']
+summary: 秒杀扣减库存设计，防止出现超卖问题
+---
+
+### 概述
+
+- 秒杀场景存在以下问题，都与库存扣减设计有关
+  - 恶意刷单
+  - 超卖
+
+- 库存扣减方案有以下几种：
+  - 下单减库存：会因为恶意刷单导致商品不能正常售卖
+  - 付款减库存：会出现超卖
+  - 预扣减库存：仍不能完全避免恶意刷单
+
+
+- 在实际应用场景中，一般选择下单减库存的方案，通过其他方式避免恶意刷单、超卖等问题
+
+### 数据库层面避免库存超卖
+
+- 执行扣减库存的sql时添加判断条件，只有当现有库存大于等于订单中的商品数量时才扣减成功
+
+### 通过分布式锁避免库存超卖
+
+- 通过分布式锁使得下单业务串行化，进而防止超卖
+
+```java
+@Override
+@Transactional(rollbackFor = Exception.class)
+public Long placeOrder(Long userId, SeckillOrderCommand seckillOrderCommand) {
+    //获取商品
+    SeckillGoodsDTO seckillGoods = seckillGoodsService.getSeckillGoods(seckillOrderCommand.getGoodsId(), seckillOrderCommand.getVersion());
+    //检测商品信息
+    this.checkSeckillGoods(seckillOrderCommand, seckillGoods);
+    String lockKey = SeckillConstants.getKey(SeckillConstants.ORDER_LOCK_KEY_PREFIX, String.valueOf(seckillOrderCommand.getGoodsId()));
+    DistributedLock lock = distributedLockFactory.getDistributedLock(lockKey);
+    // 获取内存中的库存信息
+    String key = SeckillConstants.getKey(SeckillConstants.GOODS_ITEM_STOCK_KEY_PREFIX, String.valueOf(seckillOrderCommand.getGoodsId()));
+    //是否扣减了缓存中的库存
+    boolean isDecrementCacheStock = false;
+    try {
+        //未获取到分布式锁
+        if (!lock.tryLock(2, 5, TimeUnit.SECONDS)){
+            throw new SeckillException(HttpCode.RETRY_LATER);
+        }
+        // 查询库存信息
+        Integer stock = distributedCacheService.getObject(key, Integer.class);
+        //库存不足
+        if (stock < seckillOrderCommand.getQuantity()){
+            throw new SeckillException(HttpCode.STOCK_LT_ZERO);
+        }
+        //扣减库存
+        distributedCacheService.decrement(key, seckillOrderCommand.getQuantity());
+        //正常执行了扣减缓存中库存的操作
+        isDecrementCacheStock = true;
+        //构建订单
+        SeckillOrder seckillOrder = this.buildSeckillOrder(userId, seckillOrderCommand, seckillGoods);
+        //保存订单
+        seckillOrderDomainService.saveSeckillOrder(seckillOrder);
+        //扣减数据库库存
+        seckillGoodsService.updateDbAvailableStock(seckillOrderCommand.getQuantity(), seckillOrderCommand.getGoodsId());
+        //返回订单id
+        return seckillOrder.getId();
+    } catch (Exception e) {
+        //已经扣减了缓存中的库存，则需要增加回来
+        if (isDecrementCacheStock){
+            distributedCacheService.increment(key, seckillOrderCommand.getQuantity());
+        }
+        if (e instanceof InterruptedException){
+            logger.error("SeckillPlaceOrderLockService|下单分布式锁被中断|参数:{}|异常信息:{}", JSONObject.toJSONString(seckillOrderCommand), e.getMessage());
+        }else{
+            logger.error("SeckillPlaceOrderLockService|分布式锁下单失败|参数:{}|异常信息:{}", JSONObject.toJSONString(seckillOrderCommand), e.getMessage());
+        }
+        throw new SeckillException(e.getMessage());
+    }finally {
+        lock.unlock();
+    }
+}
+```
+
+### 基于Lua脚本避免库存超卖
+
+```java
+@Override
+public Long placeOrder(Long userId, SeckillOrderCommand seckillOrderCommand) {
+    boolean decrementStock = false;
+    SeckillGoodsDTO seckillGoods = seckillGoodsService.getSeckillGoods(seckillOrderCommand.getGoodsId(), seckillOrderCommand.getVersion());
+    //检测商品
+    this.checkSeckillGoods(seckillOrderCommand, seckillGoods);
+    String key = SeckillConstants.getKey(SeckillConstants.GOODS_ITEM_STOCK_KEY_PREFIX, String.valueOf(seckillOrderCommand.getGoodsId()));
+    Long result = distributedCacheService.decrementByLua(key, seckillOrderCommand.getQuantity());
+    distributedCacheService.checkResult(result);
+    decrementStock = true;
+    try{
+        SeckillOrder seckillOrder = this.buildSeckillOrder(userId, seckillOrderCommand, seckillGoods);
+        seckillOrderDomainService.saveSeckillOrder(seckillOrder);
+        seckillGoodsService.updateDbAvailableStock(seckillOrderCommand.getQuantity(), seckillOrderCommand.getGoodsId());
+        return seckillOrder.getId();
+    }catch (Exception e){
+        //将内存中的库存增加回去
+        if (decrementStock){
+            distributedCacheService.incrementByLua(key, seckillOrderCommand.getQuantity());
+        }
+        throw e;
+    }
+}
+```
+
+```lua
+-- lua逻辑：首先判断传入的参数是否大于0，如果小于或者等于0，则返回-2，初始化库存成功，返回1
+-- 两个入参：
+-- KEYS[1] : 活动库存的key
+-- ARGV[1] : 活动库存的初始化数量
+
+local paramStock = tonumber(ARGV[1])
+
+-- 参数不能小于或者等于0
+if paramStock <= 0 then
+    return -2
+end
+
+redis.call('set',KEYS[1], paramStock)
+return 1
+```
+
+```lua
+-- lua逻辑：首先判断活动库存是否存在，如果不存在，则返回-1，如果传入的要扣减的库存数量小于或者等于0，则返回-2，增加库存成功，则返回1
+-- 两个入参：
+-- KEYS[1] : 活动库存的key
+-- ARGV[1] : 活动库存的增加数量
+local stock = redis.call('get', KEYS[1])
+
+-- 商品库存不存在
+if not stock then
+    return -1
+end
+
+local paramStock = tonumber(ARGV[1])
+
+-- 参数不能小于或者等于0
+if paramStock <= 0 then
+    return -2
+end
+
+redis.call('incrby',KEYS[1], paramStock)
+return 1
+```
+
+```lua
+-- lua逻辑：首先判断活动库存是否存在，如果库存不存在则返回-1，接下来判断传入的要扣减的库存是否大于0，如果要扣减的库存不大于0，则返回-2，库存不足返回-3，扣减库存成功返回1
+-- 两个入参：
+-- KEYS[1] : 活动库存的key
+-- ARGV[1] : 活动库存的扣减数量
+local stock = redis.call('get', KEYS[1])
+
+-- 商品库存不存在
+if not stock then
+    return -1
+end
+
+-- 获取Redis库存和扣减的库存数量
+local intStock = tonumber(stock)
+local paramStock = tonumber(ARGV[1])
+
+-- 参数不能小于或者等于0
+if paramStock <= 0 then
+    return -2
+end
+
+-- 库存不足
+if intStock < paramStock then
+    return -3
+end
+
+-- 正常扣减库存
+redis.call('decrby',KEYS[1], paramStock)
+
+return 1
+```
+
